@@ -5,6 +5,15 @@ import time, re, json, os
 import ctypes, ctypes.wintypes
 from datetime import datetime, timedelta, timezone
 
+# --- 高 DPI 支援（讓工作列圖標清晰）---
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+except:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except:
+        pass
+
 # --- 設定 CTK 基本外觀 ---
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -160,18 +169,53 @@ class FloatingClock:
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         self.root.geometry(f"+{sw//2 - 150}+{sh//2 - 50}")
 
+        # ── 啟動骨架：在時鐘 label 出現前顯示旋轉動畫 ──
+        skel_bg = self.bg_color
+        skel_w, skel_h = 300, 70
+        self._skel_canvas = tk.Canvas(root, width=skel_w, height=skel_h,
+                                      bg=skel_bg, highlightthickness=0)
+        self._skel_canvas.pack(padx=25, pady=15)
+        spin_cx, spin_cy, spin_r = skel_w // 2, skel_h // 2, 16
+        arc_color = "#3A7EBF" if self.appearance_mode == "dark" else "#4A90D9"
+        track_color = "#444444" if self.appearance_mode == "dark" else "#CCCCCC"
+        # 軌道圓環
+        self._skel_canvas.create_oval(
+            spin_cx - spin_r, spin_cy - spin_r,
+            spin_cx + spin_r, spin_cy + spin_r,
+            outline=track_color, width=3)
+        self._spin_arc = self._skel_canvas.create_arc(
+            spin_cx - spin_r, spin_cy - spin_r,
+            spin_cx + spin_r, spin_cy + spin_r,
+            start=90, extent=80, outline=arc_color, width=3, style="arc")
+        self._spin_angle = [0]
+
+        def _spin():
+            if self._skel_canvas is None:
+                return
+            try:
+                if not self._skel_canvas.winfo_exists():
+                    return
+            except:
+                return
+            self._spin_angle[0] = (self._spin_angle[0] - 12) % 360
+            self._skel_canvas.itemconfig(
+                self._spin_arc, start=self._spin_angle[0])
+            self._spin_after = root.after(40, _spin)
+
+        self._spin_after = root.after(40, _spin)
+
         # 時鐘字體加粗
         self.main_font = (self.clock_font_family, self.font_size, 'bold')
         self.label = tk.Label(root, font=self.main_font,
                               fg=self.text_color, bg=self.bg_color, padx=25, pady=15, justify='center')
-        self.label.pack()
+        # label 先不 pack，等第一次 update_clock 完成後才替換骨架
 
         self.label.bind("<Button-1>", self.start_move)
         self.label.bind("<B1-Motion>", self.do_move)
         self.label.bind("<Double-Button-1>", lambda e: self.safe_exit())
         self.label.bind("<Button-3>", self.open_ctk_main_menu)
-        
-        self.root.bind("<MouseWheel>", self.on_mouse_wheel) 
+
+        self.root.bind("<MouseWheel>", self.on_mouse_wheel)
         self.root.bind("<Control-MouseWheel>", self.on_font_zoom)
         self.root.bind_all("<Control-Shift-C>", lambda e: self.copy_smart_timestamp())
 
@@ -216,10 +260,15 @@ class FloatingClock:
         self.bg_alpha = max(0.1, min(1.0, float(getattr(self, "bg_alpha", 0.8))))
         self.text_alpha = max(0.1, min(1.0, float(getattr(self, "text_alpha", 1.0))))
         self.bg_fill_alpha = max(0.1, min(1.0, float(getattr(self, "bg_fill_alpha", 0.8))))
-        # bg_fill_alpha = 視窗整體透明度（背景滑桿/滾輪控制）
-        self.root.attributes("-alpha", self.bg_fill_alpha)
-        # text_alpha = 文字不透明度（100%=原色，低值=淡化往背景色混合）
         effective_fg = self.blend_hex(self.text_color, self.bg_color, self.text_alpha)
+
+        # dirty-flag：值沒有變就跳過 Tk 呼叫，避免每秒無謂觸發 -alpha / label.config
+        new_state = (self.bg_fill_alpha, effective_fg, self.bg_color)
+        if getattr(self, "_alpha_state_cache", None) == new_state:
+            return
+        self._alpha_state_cache = new_state
+
+        self.root.attributes("-alpha", self.bg_fill_alpha)
         if hasattr(self, "label"):
             self.label.config(fg=effective_fg, bg=self.bg_color)
 
@@ -241,10 +290,16 @@ class FloatingClock:
 
     def calc_ctk_menu_width(self, labels, font_tuple=("Microsoft JhengHei", 12), extra_px=10, min_px=170, max_px=360):
         try:
-            f = tkfont.Font(root=self.root, family=font_tuple[0], size=font_tuple[1])
+            # 快取 Font 物件，避免每次開選單都重建
+            cache_key = font_tuple
+            if not hasattr(self, "_menu_font_cache"):
+                self._menu_font_cache = {}
+            if cache_key not in self._menu_font_cache:
+                self._menu_font_cache[cache_key] = tkfont.Font(
+                    root=self.root, family=font_tuple[0], size=font_tuple[1])
+            f = self._menu_font_cache[cache_key]
             max_text = max((f.measure(str(t)) for t in labels), default=min_px)
             raw = max_text + extra_px
-            # 若超過三分之一螢幕寬就依照文字長度+10，否則縮至三分之一
             screen_third = self.root.winfo_screenwidth() // 3
             if raw > screen_third:
                 return min(max_px, max_text + 10)
@@ -404,6 +459,19 @@ class FloatingClock:
         return fmt
 
     def update_clock(self):
+        # 第一次執行時：拆掉骨架，把真正的 label pack 上去
+        if getattr(self, "_skel_canvas", None) is not None:
+            try:
+                if hasattr(self, "_spin_after"):
+                    self.root.after_cancel(self._spin_after)
+            except: pass
+            try:
+                self._skel_canvas.destroy()
+            except: pass
+            self._skel_canvas = None
+            self.label.pack()
+            self.apply_alpha_settings()
+
         self.utc_offset = self.clamp_utc_offset(self.utc_offset)
         tz = timezone(timedelta(hours=self.utc_offset))
         now = datetime.now(tz)
@@ -431,20 +499,21 @@ class FloatingClock:
             ts_str = self.current_ts_val if self.show_ms else self.current_sec_val
             display_text += f"\n{ts_str}"
         self.label.config(text=display_text)
-        self.apply_alpha_settings()
         has_ms = any(x in self.excel_date_format for x in ["S", "SSS", "SS"])
         self.root.after(50 if (has_ms or (self.show_timestamp and self.show_ms)) else 1000, self.update_clock)
 
     # --- 100% 還原選單結構 ---
     def open_ctk_main_menu(self, event):
-        try:
-            if hasattr(self, "_ctk_main_menu_win") and self._ctk_main_menu_win and self._ctk_main_menu_win.winfo_exists():
-                self._ctk_main_menu_win.destroy()
-            if hasattr(self, "_ctk_submenu_win") and self._ctk_submenu_win and self._ctk_submenu_win.winfo_exists():
-                self._ctk_submenu_win.destroy()
+        if hasattr(self, "_ctk_main_menu_win") and self._ctk_main_menu_win and self._ctk_main_menu_win.winfo_exists():
+            self._ctk_main_menu_win.destroy()
+        if hasattr(self, "_ctk_submenu_win") and self._ctk_submenu_win and self._ctk_submenu_win.winfo_exists():
+            self._ctk_submenu_win.destroy()
+        self._build_ctk_menu(event)
 
+    def _build_ctk_menu(self, event):
+        try:
             win = ctk.CTkToplevel(self.root)
-            self.set_win_icon(win)
+            # overrideredirect 選單不需要工作列圖標，略過 set_win_icon 加速開啟
             self._ctk_main_menu_win = win
             win.overrideredirect(True)
             win.attributes("-topmost", True)
@@ -557,28 +626,30 @@ class FloatingClock:
             def open_fmt_sub(btn):
                 if _sub_lock[0]: return
                 _sub_lock[0] = True
-                _poll_mute[0] = 8
+                _poll_mute[0] = 10
                 win.after(80, lambda: _sub_lock.__setitem__(0, False))
-                # 用 win 當前位置 + btn 在 frame 內的相對位置，避免 click 時座標漂移
-                bx = win.winfo_rootx() + win.winfo_width() + 2
+                mm = self._mainmenu_rect
+                bx = mm[2] if mm else win.winfo_rootx() + win.winfo_width()
                 by = btn.winfo_rooty()
                 self.show_format_submenu(bx, by, close_menu)
 
             def open_style_sub(btn):
                 if _sub_lock[0]: return
                 _sub_lock[0] = True
-                _poll_mute[0] = 8
+                _poll_mute[0] = 10
                 win.after(80, lambda: _sub_lock.__setitem__(0, False))
-                bx = win.winfo_rootx() + win.winfo_width() + 2
+                mm = self._mainmenu_rect
+                bx = mm[2] if mm else win.winfo_rootx() + win.winfo_width()
                 by = btn.winfo_rooty()
                 self.show_style_submenu(bx, by, close_menu)
 
             def open_settings_sub(btn):
                 if _sub_lock[0]: return
                 _sub_lock[0] = True
-                _poll_mute[0] = 8
+                _poll_mute[0] = 10
                 win.after(80, lambda: _sub_lock.__setitem__(0, False))
-                bx = win.winfo_rootx() + win.winfo_width() + 2
+                mm = self._mainmenu_rect
+                bx = mm[2] if mm else win.winfo_rootx() + win.winfo_width()
                 by = btn.winfo_rooty()
                 self.show_settings_submenu(bx, by, close_menu)
 
@@ -615,18 +686,11 @@ class FloatingClock:
 
             win.bind("<Escape>", lambda e: close_menu())
 
-            # 計算尺寸決定彈出位置（用 reqwidth 不需要 update_idletasks）
+            # 計算尺寸：withdraw 狀態下先 update_idletasks 取正確 reqheight
+            win.update_idletasks()
             menu_w = win.winfo_reqwidth()
             menu_h = win.winfo_reqheight()
-            try:
-                vsx = ctypes.windll.user32.GetSystemMetrics(76)
-                vsy = ctypes.windll.user32.GetSystemMetrics(77)
-                vsw = ctypes.windll.user32.GetSystemMetrics(78)
-                vsh = ctypes.windll.user32.GetSystemMetrics(79)
-            except:
-                vsx, vsy = 0, 0
-                vsw = win.winfo_screenwidth()
-                vsh = win.winfo_screenheight()
+            vsx, vsy, vsw, vsh = self._get_virtual_screen()
 
             mx = event.x_root
             my = event.y_root
@@ -638,6 +702,9 @@ class FloatingClock:
             my = max(vsy, my)
             win.geometry(f"+{mx}+{my}")
             win.deiconify()  # 定位完成後才顯示
+            # cache 主選單 rect，供 poll hit-test 使用（避免 poll 呼叫 winfo）
+            self._mainmenu_rect = (mx, my, mx + menu_w, my + menu_h)
+            self._submenu_rect = None  # 清除舊的 submenu rect
 
             def _cleanup_poll():
                 if hasattr(self, "_menu_poll_id") and self._menu_poll_id:
@@ -656,73 +723,104 @@ class FloatingClock:
             _btn_was_up = [True, True]
 
             def _poll_click():
-                try:
-                    if not win.winfo_exists():
-                        return
-                except:
-                    return
+                # 用 cache rect 做 hit-test，避免每 tick 呼叫 winfo_rootx 等 Tk IPC
                 if _poll_mute[0] > 0:
                     _poll_mute[0] -= 1
                     self._menu_poll_id = self.root.after(60, _poll_click)
                     return
                 try:
-                    for i, vk in enumerate([VK_LBUTTON, VK_RBUTTON]):
-                        pressed = bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+                    lbtn = bool(ctypes.windll.user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+                    rbtn = bool(ctypes.windll.user32.GetAsyncKeyState(VK_RBUTTON) & 0x8000)
+                    states = [lbtn, rbtn]
+                    any_new_click = False
+                    for i, pressed in enumerate(states):
                         if pressed and _btn_was_up[i]:
-                            pt = ctypes.wintypes.POINT()
-                            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-                            cx, cy = pt.x, pt.y
-                            inside = False
-                            for w in [win] + [getattr(self, a, None) for a in ("_ctk_submenu_win",)]:
-                                try:
-                                    if w and w.winfo_exists():
-                                        wx, wy = w.winfo_rootx(), w.winfo_rooty()
-                                        # 用 reqwidth/height 避免剛建立時返回 1
-                                        ww2 = max(w.winfo_width(), w.winfo_reqwidth())
-                                        wh2 = max(w.winfo_height(), w.winfo_reqheight())
-                                        if wx <= cx <= wx+ww2 and wy <= cy <= wy+wh2:
-                                            inside = True; break
-                                except: pass
-                            if not inside:
-                                close_menu()
-                                return
+                            any_new_click = True
                         _btn_was_up[i] = not pressed
-                except: pass
+
+                    if any_new_click:
+                        pt = ctypes.wintypes.POINT()
+                        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                        cx, cy = pt.x, pt.y
+                        inside = False
+                        for rect in (self._mainmenu_rect, self._submenu_rect):
+                            if rect and rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]:
+                                inside = True
+                                break
+                        if not inside:
+                            close_menu()
+                            return
+                except:
+                    pass
                 self._menu_poll_id = self.root.after(60, _poll_click)
 
             self._menu_poll_id = self.root.after(150, _poll_click)
 
             win.bind("<Escape>", lambda e: close_menu())
-            return True
         except:
-            return False
+            pass
+
+    def _get_virtual_screen(self):
+        """取得虛擬螢幕範圍，結果快取在 instance 避免重複呼叫 GetSystemMetrics。"""
+        if not hasattr(self, "_vscreen_cache"):
+            self._vscreen_cache = None
+        if self._vscreen_cache is None:
+            try:
+                vsx = ctypes.windll.user32.GetSystemMetrics(76)
+                vsy = ctypes.windll.user32.GetSystemMetrics(77)
+                vsw = ctypes.windll.user32.GetSystemMetrics(78)
+                vsh = ctypes.windll.user32.GetSystemMetrics(79)
+                self._vscreen_cache = (vsx, vsy, vsw, vsh)
+            except:
+                w = self.root.winfo_screenwidth()
+                h = self.root.winfo_screenheight()
+                self._vscreen_cache = (0, 0, w, h)
+        return self._vscreen_cache
 
     def _position_submenu(self, sub_win, x, y):
-        """次選單定位：不呼叫 update_idletasks 避免觸發主選單重排"""
-        try:
-            vsx = ctypes.windll.user32.GetSystemMetrics(76)
-            vsy = ctypes.windll.user32.GetSystemMetrics(77)
-            vsw = ctypes.windll.user32.GetSystemMetrics(78)
-            vsh = ctypes.windll.user32.GetSystemMetrics(79)
-        except:
-            vsx, vsy = 0, 0
-            vsw = sub_win.winfo_screenwidth()
-            vsh = sub_win.winfo_screenheight()
+        """
+        次選單定位：優先往主選單右側緊黏展開，右側不夠時往左緊黏展開。
+        x = 主選單右邊緣（已由呼叫者從 _mainmenu_rect[2] 取得）
+        y = 按鈕的 rooty
+        """
+        # 必須先 update_idletasks，否則 withdraw 狀態的 reqwidth/reqheight 可能回傳 1
+        sub_win.update_idletasks()
+
+        vsx, vsy, vsw, vsh = self._get_virtual_screen()
+        vsr = vsx + vsw
+        vsb = vsy + vsh
+
         mw = sub_win.winfo_reqwidth()
         mh = sub_win.winfo_reqheight()
-        fx = x if x + mw <= vsx + vsw else x - mw - 4
-        fy = y if y + mh <= vsy + vsh else vsy + vsh - mh - 4
-        fx = max(vsx, fx)
+
+        mm = getattr(self, "_mainmenu_rect", None)
+        main_left  = mm[0] if mm else (x - 200)
+        main_right = mm[2] if mm else x
+
+        # --- 水平方向：緊黏，無間距 ---
+        if main_right + mw <= vsr:
+            fx = main_right          # 右側展開，緊黏主選單右邊緣
+        else:
+            fx = main_left - mw      # 左側展開，緊黏主選單左邊緣
+        fx = max(vsx, min(fx, vsr - mw))
+
+        # --- 垂直方向：從按鈕位置往下；超出螢幕時往上貼齊 ---
+        if y + mh <= vsb:
+            fy = y
+        else:
+            fy = vsb - mh
         fy = max(vsy, fy)
+
         sub_win.geometry(f"+{fx}+{fy}")
         sub_win.deiconify()
+        self._submenu_rect = (fx, fy, fx + mw, fy + mh)
 
     def show_format_submenu(self, x, y, close_main=None):
         if hasattr(self, "_ctk_submenu_win") and self._ctk_submenu_win and self._ctk_submenu_win.winfo_exists():
             self._ctk_submenu_win.destroy()
 
         win = ctk.CTkToplevel(self.root)
-        self.set_win_icon(win)
+        # overrideredirect 選單不需要圖標
         self._ctk_submenu_win = win
         win.withdraw()
         win.overrideredirect(True)
@@ -762,6 +860,7 @@ class FloatingClock:
                     win.destroy()
             except:
                 pass
+            self._submenu_rect = None  # 清除 cache，poll 不再偵測已關閉的 submenu
             if close_main:
                 close_main()
 
@@ -845,7 +944,7 @@ class FloatingClock:
         if hasattr(self, "_ctk_submenu_win") and self._ctk_submenu_win and self._ctk_submenu_win.winfo_exists():
             self._ctk_submenu_win.destroy()
         win = ctk.CTkToplevel(self.root)
-        self.set_win_icon(win)
+        # overrideredirect 選單不需要圖標
         self._ctk_submenu_win = win
         win.withdraw()
         win.overrideredirect(True)
@@ -870,6 +969,7 @@ class FloatingClock:
             try:
                 if win.winfo_exists(): win.destroy()
             except: pass
+            self._submenu_rect = None
             if close_main: close_main()
 
         def run_action(action):
@@ -892,7 +992,7 @@ class FloatingClock:
         if hasattr(self, "_ctk_submenu_win") and self._ctk_submenu_win and self._ctk_submenu_win.winfo_exists():
             self._ctk_submenu_win.destroy()
         win = ctk.CTkToplevel(self.root)
-        self.set_win_icon(win)
+        # overrideredirect 選單不需要圖標
         self._ctk_submenu_win = win
         win.withdraw()
         win.overrideredirect(True)
@@ -919,6 +1019,7 @@ class FloatingClock:
             try:
                 if win.winfo_exists(): win.destroy()
             except: pass
+            self._submenu_rect = None
             if close_main: close_main()
 
 
@@ -950,7 +1051,7 @@ class FloatingClock:
                 w.bind("<Button-1>", on_click)
             return outer
 
-        VERSION = "Ver 1.0.0"
+        VERSION = "Ver 1.0.1"
         # 當前深色→按鈕說「使用淺色」→顯示🌤；當前淺色→按鈕說「使用深色」→顯示🌙
         # 當前深色→「使用淺色」→顯示☀️；當前淺色→「使用深色」→顯示🌙
         moon_icon = "☀️" if self.appearance_mode == "dark" else "🌙"
@@ -979,7 +1080,8 @@ class FloatingClock:
         self._position_submenu(win, x, y)
 
     def _open_help_dialog(self):
-        VERSION = "Ver 1.0.0"
+        VERSION = "Ver 1.0.1"
+        BUILD = "Dev-0406.3"  # Dev 版號（供開發紀錄用）
         win = ctk.CTkToplevel(self.root)
         self.set_win_icon(win)
         win.title(self.t("help") + " / About")
@@ -1022,6 +1124,11 @@ class FloatingClock:
 
         ctk.CTkButton(pad, text=self.t("msg_ok"), font=win_f, width=90,
                       command=win.destroy).pack(pady=(18, 0))
+
+        # Build 號顯示在視窗最下方
+        hint_color = "#666666" if self.appearance_mode == "dark" else "#999999"
+        ctk.CTkLabel(pad, text=BUILD, font=("Consolas", 10),
+                     text_color=hint_color, anchor="center").pack(pady=(10, 0))
 
     def _set_app_icon(self):
         """載入 app.ico，設定主視窗工作列圖標"""
@@ -1070,9 +1177,9 @@ class FloatingClock:
             return
         ico = self._app_icon
         try:
-            # after(1) 等視窗建立，after(100) 確保 CTk 初始化完成後再設
             win.after(1,   lambda: win.wm_iconbitmap(ico) if win.winfo_exists() else None)
-            win.after(100, lambda: win.wm_iconbitmap(ico) if win.winfo_exists() else None)
+            win.after(200, lambda: win.wm_iconbitmap(ico) if win.winfo_exists() else None)
+            win.after(500, lambda: win.wm_iconbitmap(ico) if win.winfo_exists() else None)
         except: pass
 
     def toggle_topmost(self):
