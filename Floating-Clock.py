@@ -1081,7 +1081,7 @@ class FloatingClock:
 
     def _open_help_dialog(self):
         VERSION = "Ver 1.0.1"
-        BUILD = "Dev-0406.3"  # Dev 版號（供開發紀錄用）
+        #BUILD = "Dev-0406.4"  # Dev 版號（供開發紀錄用）
         win = ctk.CTkToplevel(self.root)
         self.set_win_icon(win)
         win.title(self.t("help") + " / About")
@@ -1481,12 +1481,16 @@ class FloatingClock:
         if picked:
             self.text_color = picked
             self._push_recent_color(picked)
+            self._alpha_state_cache = None
+            self.apply_alpha_settings()
 
     def change_bg_color(self):
         picked = self.open_color_picker(self.t("pick_bg_title"), self.bg_color)
         if picked:
             self.bg_color = picked
             self._push_recent_color(picked)
+            self._alpha_state_cache = None
+            self.apply_alpha_settings()
 
     def _push_recent_color(self, hex_color):
         recent = list(getattr(self, "recent_colors", []))
