@@ -26,9 +26,9 @@ A lightweight always-on-top floating clock for Windows with a modern UI and full
 
 ### 直接執行 / Run EXE
 
-前往 [Releases](../../releases) 下載最新版 `Floating-Clock.exe`，與 `app.ico` 放在同一資料夾後直接執行。
+前往 [Releases](../../releases) 下載最新版 `Floating-Clock.exe`。
 
-Download the latest `Floating-Clock.exe` from [Releases](../../releases), place it in the same folder as `app.ico`, and run.
+Download the latest `Floating-Clock.exe` from [Releases](../../releases).
 
 ### 原始碼執行 / Run from Source
 
