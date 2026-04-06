@@ -5,6 +5,15 @@ import time, re, json, os
 import ctypes, ctypes.wintypes
 from datetime import datetime, timedelta, timezone
 
+# --- 高 DPI 支援（讓工作列圖標清晰）---
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+except:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except:
+        pass
+
 # --- 設定 CTK 基本外觀 ---
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -615,7 +624,8 @@ class FloatingClock:
 
             win.bind("<Escape>", lambda e: close_menu())
 
-            # 計算尺寸決定彈出位置（用 reqwidth 不需要 update_idletasks）
+            # 計算尺寸：withdraw 狀態下先 update_idletasks 取正確 reqheight
+            win.update_idletasks()
             menu_w = win.winfo_reqwidth()
             menu_h = win.winfo_reqheight()
             try:
@@ -1024,13 +1034,12 @@ class FloatingClock:
                       command=win.destroy).pack(pady=(18, 0))
 
     def _set_app_icon(self):
-        """載入 app.ico，設定主視窗工作列圖標"""
+        """載入 app.ico，透過 Win32 API 設定主視窗圖標"""
         import sys, os
-        # 依序嘗試各種路徑（PyInstaller / Nuitka / 直接執行）
         candidates = []
-        if hasattr(sys, "_MEIPASS"):                          # PyInstaller
+        if hasattr(sys, "_MEIPASS"):
             candidates.append(sys._MEIPASS)
-        if hasattr(sys, "frozen"):                            # Nuitka onefile
+        if hasattr(sys, "frozen"):
             candidates.append(os.path.dirname(sys.executable))
         candidates.append(os.path.dirname(os.path.abspath(__file__)))
         candidates.append(os.path.dirname(os.path.abspath(sys.argv[0])))
@@ -1050,30 +1059,36 @@ class FloatingClock:
         try:
             self.root.wm_iconbitmap(ico_path)
         except: pass
-        # overrideredirect 視窗工作列圖標需要額外設定
-        try:
-            self.root.iconbitmap(ico_path)
-        except: pass
-        # 延遲再設一次確保生效
-        self.root.after(100, lambda: self._apply_taskbar_icon(ico_path))
+        self.root.after(200, lambda: self._apply_win32_icon(self.root, ico_path))
 
-    def _apply_taskbar_icon(self, ico_path):
-        """確保工作列圖標正確顯示（overrideredirect 視窗需特殊處理）"""
+    def _apply_win32_icon(self, win, ico_path):
+        """
+        ICON_BIG  → 256px（工作列/Tab切換用大圖）
+        ICON_SMALL → 48px（標題列，讓系統自動縮成 16px，效果比手動繪製好）
+        """
         try:
-            self.root.wm_iconbitmap(ico_path)
-            self.root.iconbitmap(ico_path)
+            WM_SETICON  = 0x0080
+            LR_LOADFROMFILE = 0x00000010
+            hwnd = ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)
+            if not hwnd:
+                hwnd = win.winfo_id()
+            hicon_big   = ctypes.windll.user32.LoadImageW(
+                None, ico_path, 1, 256, 256, LR_LOADFROMFILE)
+            hicon_small = ctypes.windll.user32.LoadImageW(
+                None, ico_path, 1,  48,  48, LR_LOADFROMFILE)
+            if hicon_big:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 1, hicon_big)
+            if hicon_small:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, 0, hicon_small)
         except: pass
 
     def set_win_icon(self, win):
-        """為任意 CTkToplevel 設定圖標"""
+        """為任意 CTkToplevel 設定清晰圖標"""
         if not self._app_icon:
             return
         ico = self._app_icon
-        try:
-            # after(1) 等視窗建立，after(100) 確保 CTk 初始化完成後再設
-            win.after(1,   lambda: win.wm_iconbitmap(ico) if win.winfo_exists() else None)
-            win.after(100, lambda: win.wm_iconbitmap(ico) if win.winfo_exists() else None)
-        except: pass
+        win.after(1,   lambda: self._apply_win32_icon(win, ico) if win.winfo_exists() else None)
+        win.after(300, lambda: self._apply_win32_icon(win, ico) if win.winfo_exists() else None)
 
     def toggle_topmost(self):
         self.is_topmost = not self.is_topmost
